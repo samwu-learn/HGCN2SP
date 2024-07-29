@@ -1,0 +1,45 @@
+{
+    "Policy": {
+        "sparse":true,
+        "var_dim":2,
+        "con_dim":1,
+        "l_hid_dim":128,
+        "scenario_dim":64,
+        "h_hid_dim":128,
+        "h_out_dim":64,
+        "n_heads": 8, 
+        "clip":10.0
+    },
+    "TrainData":{
+        "n_scenarios":200,
+        "pkl_folder":"./train_scenarios_new/",
+        "result_folder":"./new_resu/",
+        "save_path":"./data/train_data_origin.pt",
+        "cls_path":"./data/train_cls_data_origin.pkl"
+    },
+    "TestData":{
+        "n_scenarios":200,
+        "pkl_folder":"./test_scenarios/",
+        "result_folder":"./test_results/",
+        "save_path":"./data/test_data_cflp.pt",     
+        "cls_path":"./data/test_cls_data_cflp.pkl"
+    },
+    "Env": {
+        "value_net":true,
+        "critic_net":true
+    },
+    "train":{
+        "sel_num": 5,
+        "n_scenarios":200,
+        "decode_type":"greedy",
+        "eval_epoch":2,
+        "eval_path":"./eval_instance",
+        "model_path":"./model_path",
+        "eval_pt":"eval_origin.pt",
+        "eval_cls":"eval_cls_origin.pkl"
+    },
+    "test":{
+        "sel_num":5,
+        "decode_type":"greedy"
+    }
+}   
