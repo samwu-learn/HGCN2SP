@@ -109,10 +109,10 @@ python run.py --config_file ./configs/cflp_config.json
 如果您在研究中使用了HGCN2SP，请引用我们的论文：
 
 ```bibtex
-@article{wu2024hgcn2sp,
-  title={HGCN2SP: Hierarchical Graph Convolutional Network for Two-Stage Stochastic Programming},
+@inproceedings{wu2024hgcn2sp,
+  title={HGCN2SP: hierarchical graph convolutional network for two-stage stochastic programming},
   author={Wu, Yang and Zhang, Yifan and Liang, Zhenxing and Cheng, Jian},
-  journal={arXiv preprint},
+  booktitle={Forty-first International Conference on Machine Learning},
   year={2024}
 }
 ```
