@@ -186,194 +186,6 @@ def _get_cflp_features(cluster_dict):
     
     return adjs, all_feature, cons_feature
 
-def _get_ndp_features(cluster_dict):    #ndp问题
-    #获取基本数据 
-    param = cluster_dict['param']
-    scenarios = cluster_dict['scenarios']
-    n_origins = param['n_origins']
-    n_destinations = param['n_destinations']
-    n_intermediates = param['n_intermediates']
-    n_scenarios = len(scenarios)
-
-    n_vertices = n_origins + n_destinations + n_intermediates
-    n_ods = n_origins * n_destinations
-    n_trans = n_vertices * n_vertices - n_vertices - n_ods
-    n_alls = n_ods + n_trans
-
-    # vertices
-    vertices = range(n_origins + n_destinations + n_intermediates) # all vertices
-    origins = vertices[:n_origins] # origins
-    destinations = vertices[-n_destinations:] # destinations
-        
-    # arcs
-    od_arcs = list(product(origins, destinations)) # all arcs linking origins to destinations
-    transport_arcs = [arc for arc in product(vertices, vertices) 
-                            if arc[0] != arc[1] and arc not in od_arcs] # all arcs but od pairs
-    all_arcs = od_arcs + transport_arcs
-
-    cargoes = {}
-    num = 0
-    for edge in od_arcs:
-        cargoes[edge] = num
-        num += 1
-
-    first_var = {}
-    num = 0
-    for arc in transport_arcs:
-        i = arc[0]
-        j = arc[1]
-        first_var[(i,j)] = num
-        num += 1
-
-    second_var = {}
-    num = 0
-    for (arc, od) in product(all_arcs, od_arcs):
-        i = arc[0]
-        j = arc[1]
-        k = cargoes[od]
-        second_var[(i,j,k)] = num
-        num += 1
-
-    def d(vertex, od, s):
-        k = cargoes[od]
-        demand = scenarios[s][k]
-        if vertex == od[0]: # if the vertex is the origin of the commodity
-            return demand
-        elif vertex == od[1]: # if the vertex is the destination of the commodity
-            return -demand
-        else: # if the vertex is an intermediate step
-            return 0
-
-    adjs = []
-    all_feature = None
-    cons_feature = None
-    cflp_feature = []    #  标记某个场景的特征
-
-    #分场景保存数据
-    for s in range(n_scenarios):
-        con_index = 0
-        cflp_feature = []  #更新特征
-        data = []
-        row = []
-        col = []
-
-        cons_number = n_trans + n_vertices * n_ods 
-        #约束阶段
-
-        #第二阶段约束 注意每个场景都有以下两个约束
-        #约束 1
-        for arc in transport_arcs:
-            i = arc[0]
-            j = arc[1]
-            cons = []
-            cons_a = []
-            cons_b = []
-            cons_a.append(-param['capacity'][arc])  #yij
-            cons_b.append(param['opening_cost'][arc])
-            for od in od_arcs: #zijk
-                k = cargoes[od]
-                cons_a.append(1)
-                cons_b.append(param['shipping_cost'][arc])
-                #邻接矩阵
-                data.append(1)
-                row.append(con_index)
-                col.append(cons_number+n_trans+second_var[(i,j,k)])
-            cons_a = np.array(cons_a)
-            cons_b = np.array(cons_b)
-            obj = np.dot(cons_a,cons_b) / (np.linalg.norm(cons_a)*np.linalg.norm(cons_b))
-            cons.append(obj)
-            cflp_feature.append(cons)
-
-            #邻接矩阵
-            data.append(-param['capacity'][arc] / np.max(param['capacity']))
-            row.append(con_index)
-            col.append(cons_number+first_var[(i,j)])
-
-            con_index += 1
-
-        #约束2 
-        for vertex, od in product(vertices, od_arcs):
-            k = cargoes[od]
-            cons = []
-            cons_a = []
-            cons_b = []
-            cons_a.append(-d(vertex, od, s)) #hsi
-            cons_b.append(0)
-            for arc in all_arcs:
-                i = arc[0]
-                j = arc[1]
-                if arc[0] == vertex:
-                    cons_a.append(1)
-                    cons_b.append(param['shipping_cost'][arc])
-                    #邻接矩阵
-                    data.append(1)
-                    row.append(con_index)
-                    col.append(cons_number+n_trans+second_var[(i,j,k)])
-                elif arc[1] == vertex:
-                    cons_a.append(-1)
-                    cons_b.append(param['shipping_cost'][arc])
-                    #邻接矩阵
-                    data.append(-1)
-                    row.append(con_index)
-                    col.append(cons_number+n_trans+second_var[(i,j,k)])
-                else :
-                    continue
-            cons_a = np.array(cons_a)
-            cons_b = np.array(cons_b)
-            obj = np.dot(cons_a,cons_b) / (np.linalg.norm(cons_a)*np.linalg.norm(cons_b))
-            cons.append(obj)
-            cflp_feature.append(cons)
-
-            con_index += 1
-        
-        #生成约束的特征以及adj
-        features = np.array(cflp_feature)
-        features = lil_matrix(features.astype(float))
-        #features, _ = preprocess_features(features)
-        features = features.todense()
-        features = torch.FloatTensor(features[np.newaxis])
-        if cons_feature == None:
-            cons_feature = features
-        else :
-            cons_feature = torch.cat((cons_feature, features), dim = 0)
-        
-        feature_size = len(cflp_feature) + n_trans + n_alls * n_ods
-        data = np.array(data)
-        row = np.array(row)
-        col = np.array(col)
-        adj = csr_matrix((data, (row, col)), shape=(feature_size, feature_size))
-        adj = normalize_adj(adj + sp.eye(adj.shape[0]))
-        adjs.append(adj)
-        
-        cflp_feature = []
-
-        #yij
-        for arc in transport_arcs:
-            var = []
-            var.append(param['opening_cost'][arc] / np.max(param['opening_cost']))
-            var.append(param['capacity'][arc] / np.max(param['capacity']))
-            cflp_feature.append(var)
-        
-        #zijk
-        for (arc, od) in product(all_arcs, od_arcs):
-            var = []
-            var.append(param['shipping_cost'][arc] / np.max(param['shipping_cost'][arc]))
-            var.append(0)
-            cflp_feature.append(var)
-     
-        #生成场景的特征以及adj
-        features = np.array(cflp_feature)
-        features = lil_matrix(features.astype(float))
-        #features, _ = preprocess_features(features)
-        features = features.todense()
-        features = torch.FloatTensor(features[np.newaxis])
-        if all_feature == None:
-            all_feature = features
-        else :
-            all_feature = torch.cat((all_feature, features), dim = 0)
-    
-    return adjs, all_feature, cons_feature
-
 
 #生成batch数据  --------------------------
 def padding_feat(feat):
@@ -412,11 +224,7 @@ def build_batch_data(all_adjs,all_var_feats,all_con_feats, all_edge_scen):
 #处理特征为batch图数据  --------------------------
 def process_cluster_file(cluster_file, cluster_dict, feature_type, mp_data_list):
     print("Now:", cluster_file)
-    if feature_type == 'ndp':
-        adjs, all_feature, cons_feature = _get_ndp_features(cluster_dict)
-        edge_adj = torch.from_numpy(cluster_dict['scenarios']).float()
-        edge_adj = F.cosine_similarity(edge_adj.unsqueeze(1), edge_adj.unsqueeze(0), dim=2)
-    elif feature_type == 'cflp':
+    if feature_type == 'cflp':
         adjs, all_feature, cons_feature = _get_cflp_features(cluster_dict)
         edge_adj = torch.from_numpy(cluster_dict['second_stage']["h"]).float()
         edge_adj = F.cosine_similarity(edge_adj.unsqueeze(1), edge_adj.unsqueeze(0), dim=2)
@@ -463,7 +271,7 @@ def process_data(source_folder, cluster_dicts, feature_type, process_type):
 
         total_size = len(batch_graphs)  
 
-        # change!!!
+        # change !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
         train_size =  8192
 
 
@@ -529,9 +337,9 @@ def process_data(source_folder, cluster_dicts, feature_type, process_type):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gnn_Transformer for two_stage")
     parser.add_argument('--config_file', type=str, default='./configs/cflp_config.json', help="base config json dir")
-    parser.add_argument('--scenarios_folder', type=str, default='./test_scenarios/', help="base scenarios folder")
+    parser.add_argument('--scenarios_folder', type=str, default='./train_scenarios/', help="base scenarios folder")
     parser.add_argument('--feature_type', type=str, default='cflp', help="type of problem")
-    parser.add_argument('--process_type', type=str, default='test', help="type of process")
+    parser.add_argument('--process_type', type=str, default='train', help="type of process")
     args = parser.parse_args()
     source_folder = args.scenarios_folder
     all_kwargs = json.load(open(args.config_file, 'r'))
@@ -543,7 +351,7 @@ if __name__ == "__main__":
 
     cluster_dicts = sorted(os.listdir(source_folder), key=sort_key)
 
-#-------------------------------------- 选择多少个数据
+#-------------------------------------- 选择多少个数据 !!!!!!!!!
     k = min(8292, len(cluster_dicts))                                              #前k个
 
     cluster_dicts = cluster_dicts[:k]

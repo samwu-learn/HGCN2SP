@@ -1,48 +1,77 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
-import argparse, json
+from dataclasses import dataclass
 import os
+import time
+import torch
+import numpy as np
+import wandb
+from agent import Agent
+from env import CFLPEnv
+from sample import Sampler
+import argparse
+import json
 import pickle
 import random
-import re
-import time
-from dataclasses import dataclass
-import wandb
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import tyro
-from torch.distributions.normal import Normal
-import torch.multiprocessing as mp
-from utils import solve_cflp_softmax_new
-from models import Encoder, DecoderCell, CriticCell, Encoder
-import os
-from tqdm import tqdm
 import pandas as pd
-import torch.nn.functional as F
-
+import tyro
+from utils import solve_cflp_softmax_new
+from trainer import PPOTrainer
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """实验的名称"""
-    device_id: int = 2
+    device_id: int = 3
     """device的id 位置"""
-    seed: int = 4
+    seed: int = 16
     """实验的随机种子"""
     torch_deterministic: bool = True
     """如果设置为True,则`torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """如果设置为True,则默认启用cuda"""
-    model_test_path: str = "./model_path/CFLP.pt"
+    track: bool = False
+    """如果设置为True,则使用Weights and Biases跟踪此实验"""
+    wandb_project_name: str = ""
+    """Weights and Biases的项目名称"""
+    wandb_entity: str = ""
+    """Weights and Biases的实体(团队)"""
+    capture_video: bool = False
+    """是否捕获代理的表现视频（请查看`videos`文件夹）"""
+    save_model: bool = True
+    """是否保存模型到`runs/{run_name}`文件夹"""
+    upload_model: bool = False
+    """是否将保存的模型上传到Hugging Face"""
+    hf_entity: str = ""
+    """来自Hugging Face Hub的模型仓库的用户或组织名称"""
+    model_test_path: str = ""
     """模型测试的参数地址"""
 
     # 算法特定的参数
-    mode: str = "test"
+    mode: str = "train"
     """"算法模式"""
     env_id: str = "CFLP"
     """环境的ID"""
-    clip_coef: float = 0.25
+    total_timesteps: int = 20480
+    """实验的总步数"""
+    learning_rate: float = 2.5e-4
+    """优化器的学习率"""
+    num_envs: int = 2048
+    """并行游戏环境的数量"""
+    num_steps: int = 1
+    """每个策略回合在每个环境中运行的步数"""
+    anneal_lr: bool = True
+    """是否对策略和值网络进行学习率退火"""
+    gamma: float = 0.99
+    """折扣因子 gamma"""
+    gae_lambda: float = 0.95
+    """用于广义优势估计的 lambda 值"""
+    num_minibatches: int = 16
+    """mini-batch 的数量"""
+    update_epochs: int = 10
+    """更新策略的 K 个epochs"""
+    norm_adv: bool = True
+    """是否进行优势归一化"""
+    clip_coef: float = 0.20
     """策略梯度裁剪系数"""
     clip_vloss: bool = True
     """是否对值函数使用裁剪损失，根据论文"""
@@ -55,52 +84,55 @@ class Args:
     target_kl: float = None
     """目标KL散度阈值"""
 
+    # 在运行时填充
+    batch_size: int = 0
+    """批量大小（在运行时计算）"""
+    minibatch_size: int = 0
+    """mini-batch 大小（在运行时计算）"""
+    num_iterations: int = 0
+    """迭代次数（在运行时计算）"""
 
-
-def load_param(parser):
+# 读取参数
+def load_param(parser, device, mode = "train"):
     args = parser.parse_args()
     all_kwargs = json.load(open(args.config_file, 'r'))
+    data_param = all_kwargs['TrainData']
     #load train param
     policy_param = all_kwargs['Policy']
     train_param = all_kwargs['train']
+    if mode == "train":
+        data = torch.load(data_param["save_path"])
+        train_cls = data_param['cls_path']
+        n_scenarios = train_param["sel_num"]
+        bs = []
+        clusters = []
+        # 从文件中读取列表
+        with open(train_cls, 'rb') as f:
+            cls_path = pickle.load(f)
 
-    return policy_param, train_param
+        for i in range(len(cls_path)):
+            cls_loc = os.path.join(data_param['pkl_folder'], cls_path[i])  
+            with open(cls_loc, 'rb') as f:
+                cls = pickle.load(f)
+                clusters.append(cls)
 
+            file_path = f"result_of_{cls_path[i][10:-4]}.pkl"
+            file_path = os.path.join(data_param['result_folder'], file_path) 
+            with open(file_path, "rb") as f:
+                result = pickle.load(f)
+                ans = []
+                for key in result['X'].keys():
+                    ans.append(float(result['X'][key]))
+                ans.append(result['primal'])
+                bs.append(ans)
 
+        return policy_param, train_param, data, bs, n_scenarios, clusters
+    elif mode == "test":
+        return policy_param, train_param
+    else:
+        raise ValueError("mode should be train or test")
 
-class Agent(nn.Module):
-    def __init__(self, policy_param, train_param, device):
-        super().__init__()
-        self.features_extractor = Encoder(policy_param['var_dim'], policy_param['con_dim'], policy_param['l_hid_dim'], policy_param['scenario_dim'], policy_param['h_hid_dim'], policy_param['h_out_dim'])
-        self.actor = DecoderCell(policy_param['scenario_dim'], policy_param['n_heads'], policy_param['clip'])
-        self.critic = CriticCell()
-        self.device = device
-        self.decode_type = train_param['decode_type']
-        self.cluster_k = train_param['sel_num']
-
-
-    def get_action_and_value(self, x, action=None, decode_type="sampling", cluster_k=None):
-        self.decode_type = decode_type
-        batch_feat = []
-        batch_edge = []
-        #print("node_em_of_different_scenarioss:", torch.mean(x[0].x[0:251] - x[0].x[251:502]))
-        for i in range(len(x)):
-            x[i] = x[i].to(self.device)
-            feat, c = self.features_extractor(x[i])
-            batch_feat.append(feat)
-            batch_edge.append(c)
-            x[i] = x[i].cpu()
-        batch_feat = torch.stack(batch_feat)
-        batch_edge = torch.stack(batch_edge)
-        encoder_output = (batch_feat, batch_edge)
-        if action is not None:
-            action = action.to(torch.int64)
-        if cluster_k is not None:
-            self.cluster_k = cluster_k
-        action, logprob = self.actor(self.device, encoder_output, return_cost = True, cluster_k = self.cluster_k, decode_type = self.decode_type, action = action)
-        
-        return action, logprob
-
+# 测试用函数
 def test_model(test_cls_path, action, test_ins_num, test_pararm):
     mean_bs = 0
     mean_agent = 0
@@ -131,7 +163,7 @@ def test_model(test_cls_path, action, test_ins_num, test_pararm):
         test_results = {}
         test_results['primal'] = test_[-1].item()
         test_results['time'] = test_[-2].item()
-        if abs(cost - 1.0) < 1e-5:
+        if abs(cost - 1.0) < 1e-5: 
             now_delta = 0.0
         else :
             now_delta = (test_results['primal'] - bs)/ bs *100
@@ -150,10 +182,10 @@ def test_model(test_cls_path, action, test_ins_num, test_pararm):
     print(f"Test  Averge:  agent:{mean_agent}  bs:{mean_bs}  time:{mean_time}  gap:{delta}%")
     return file_name,np_agent, np_bs, np_time, np_delta
 
-def test(parser, model_test_path, test_ins_num, device, nums=1, seed=16, clip=0.2, alpha=0.001):
+def test(parser, mode, model_test_path, test_ins_num, device, nums=1, seed=16, clip=0.2, alpha=0.001):
     '''num: 测试的次数，多次试验，避免机器、随机性的影响'''
     mean_agent, mean_bs, mean_time, delta = [],[],[],[]
-    policy_param, train_param = load_param(parser)
+    policy_param, train_param = load_param(parser, device, mode = mode)
     agent = Agent(policy_param, train_param, device).to(device)
     print("Test "+model_test_path+" ....")
     param = torch.load(model_test_path, map_location=device)
@@ -175,7 +207,7 @@ def test(parser, model_test_path, test_ins_num, device, nums=1, seed=16, clip=0.
     for num in range(nums): 
         with torch.no_grad():
             start = time.time()
-            action, log_p= agent.get_action_and_value(test_data, decode_type=test_decoder, cluster_k=sel_num)
+            action, log_p= agent.get_action_and_value(test_data, decode_type=test_decoder, cluster_k=sel_num, mode = mode)
             print("Model_time:", time.time() - start)
             file_name, np_agent, np_bs, np_time, np_delta = test_model(test_cls_path, action, test_ins_num, test_pararm)
             idx = [num]*len(np_agent)
@@ -219,7 +251,23 @@ if __name__ == "__main__":
     parser.add_argument('--config_file', type=str, default='./configs/cflp_config.json', help="base config json dir")
 
     args = tyro.cli(Args)
-    # import sys 
+    args.batch_size = int(args.num_envs * args.num_steps)
+    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    args.num_iterations = args.total_timesteps // args.batch_size
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    if args.track and args.mode == "train":
+        
+
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=vars(args),
+            name=run_name,
+            monitor_gym=True,
+            save_code=True,
+        )
+
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -228,7 +276,14 @@ if __name__ == "__main__":
 
     if args.device_id is not None:
         torch.cuda.set_device(args.device_id)
-
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-    
-    test(parser, args.model_test_path, 100, device, nums=1, seed = args.seed, clip = args.clip_coef, alpha = 0.0001)
+
+    if args.mode == "train":
+        policy_param, train_param, data, bs, n_scenarios, clusters = load_param(parser, device)
+        # trainer setup
+        trainer = PPOTrainer(args, policy_param, train_param, data, bs, clusters, run_name, device)
+        trainer.train()
+    elif args.mode == "test":
+        test(parser, args.mode, args.model_test_path, 100, device, nums=1, seed = args.seed, clip = args.clip_coef, alpha = 0.0001)
+
+        
